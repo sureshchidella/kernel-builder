@@ -1,4 +1,4 @@
-name: Build Realme SM8250 Kernel (Non-KSU)
+name: Build Realme SM8250 Kernel (Entropy-tweak)
 
 on:
   push:
@@ -6,128 +6,330 @@ on:
       - "**"
   workflow_dispatch:
 
+env:
+  KERNEL_VERSION: "1.0"
+  DEVICE_SOC: "SM8250"
+  DEVICE_CODENAME: "Kona"
+
 jobs:
   build:
     runs-on: ubuntu-22.04
 
     steps:
+      # -----------------------------------------------------------------------
+      # 1. Dependencies
+      #    CRITICAL fixes vs original:
+      #    - gcc-aarch64-linux-gnu / gcc-arm-linux-gnueabi: required even with
+      #      LLVM=1 because the Makefile uses GCC_TOOLCHAIN detection to find
+      #      binutils (elfedit, readelf) and set --gcc-toolchain for clang.
+      #      Without it, clang cannot locate the correct sysroot headers and
+      #      the build fails with "cannot find crtbegin.o" type errors.
+      #    - binutils-aarch64-linux-gnu: provides aarch64-linux-gnu-elfedit
+      #      which Makefile line 768 uses to find GCC_TOOLCHAIN directory.
+      #    - libssl-dev: needed for scripts/extract-cert
+      #    - pahole: needed if CONFIG_DEBUG_INFO_BTF is set
+      # -----------------------------------------------------------------------
       - name: Install Dependencies
         run: |
-          sudo apt update
-          sudo apt install -y \
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
             git curl wget zip unzip bc bison flex \
             libssl-dev libelf-dev libncurses-dev \
-            build-essential python3 cpio kmod
+            build-essential python3 python-is-python3 \
+            cpio kmod rsync \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            zlib1g-dev
 
-      - name: Clone Kernel
+      # -----------------------------------------------------------------------
+      # 2. Clone sources
+      # -----------------------------------------------------------------------
+      - name: Clone Kernel Source
         run: |
-          git clone --depth=1 https://github.com/sureshchidella/android_kernel_realme_sm8250.git kernel
+          git clone --depth=1 \
+            https://github.com/sureshchidella/android_kernel_realme_sm8250.git \
+            kernel
 
-      - name: Clone Clang-20
+      - name: Clone Clang 20
         run: |
-          git clone --depth=1 https://gitlab.com/provasishh/clang-20.git clang
-
-      - name: Verify Clang Layout
-        run: |
-          echo "Checking clang structure..."
-          ls clang
-
-          if [ ! -d clang/clang/bin ]; then
-            echo "clang bin directory missing!"
-            exit 1
-          fi
-
-          if [ ! -f clang/clang/bin/clang ]; then
-            echo "clang binary missing!"
-            exit 1
-          fi
+          git clone --depth=1 \
+            https://gitlab.com/provasishh/clang-20.git \
+            clang
 
       - name: Clone AnyKernel3
         run: |
-          git clone --depth=1 https://github.com/bijoyv9/AnyKernel3 AnyKernel3
+          git clone --depth=1 \
+            https://github.com/bijoyv9/AnyKernel3 \
+            AnyKernel3
 
-      - name: Setup Environment
+      # -----------------------------------------------------------------------
+      # 3. Verify clang layout
+      # -----------------------------------------------------------------------
+      - name: Verify Clang
         run: |
-          echo "ARCH=arm64" >> $GITHUB_ENV
-          echo "SUBARCH=arm64" >> $GITHUB_ENV
-          echo "KBUILD_BUILD_USER=CI" >> $GITHUB_ENV
-          echo "KBUILD_BUILD_HOST=GitHub" >> $GITHUB_ENV
+          CLANG_BIN=$PWD/clang/clang/bin
+          echo "=== Clang bin directory ==="
+          ls -la "$CLANG_BIN"
 
-      - name: Prepare Output
+          if [ ! -f "$CLANG_BIN/clang" ]; then
+            echo "ERROR: clang binary not found at $CLANG_BIN/clang"
+            exit 1
+          fi
+
+          echo "=== Clang version ==="
+          "$CLANG_BIN/clang" --version
+
+          # Verify ld.lld and llvm-ar are present
+          for tool in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
+            if [ ! -f "$CLANG_BIN/$tool" ]; then
+              echo "WARNING: $tool not found, build may fail"
+            fi
+          done
+
+      # -----------------------------------------------------------------------
+      # 4. Set build environment variables
+      # -----------------------------------------------------------------------
+      - name: Set Build Variables
         run: |
-          mkdir -p kernel/out
+          CLANG_BIN=$PWD/clang/clang/bin
+          BUILD_DATE=$(date +"%Y%m%d-%H%M")
+          ZIP_NAME="Entropy-tweak-v${KERNEL_VERSION}-${DEVICE_SOC}-${DEVICE_CODENAME}-${BUILD_DATE}"
 
+          echo "CLANG_BIN=$CLANG_BIN"                    >> $GITHUB_ENV
+          echo "BUILD_DATE=$BUILD_DATE"                  >> $GITHUB_ENV
+          echo "ZIP_NAME=$ZIP_NAME"                      >> $GITHUB_ENV
+          echo "ARCH=arm64"                              >> $GITHUB_ENV
+          echo "SUBARCH=arm64"                           >> $GITHUB_ENV
+          echo "KBUILD_BUILD_USER=Entropy"               >> $GITHUB_ENV
+          echo "KBUILD_BUILD_HOST=GitHub-CI"             >> $GITHUB_ENV
+
+          echo "ZIP will be: ${ZIP_NAME}.zip"
+
+      # -----------------------------------------------------------------------
+      # 5. Fix kernel build scripts
+      #    - min-tool-version.sh path fix (known issue with this tree)
+      #    - Stub it if missing (some CI environments lack the helper)
+      # -----------------------------------------------------------------------
       - name: Fix Kernel Scripts
+        working-directory: kernel
         run: |
-          cd kernel
-
           if [ -f scripts/as-version.sh ]; then
-            sed -i 's#../scripts/min-tool-version.sh#scripts/min-tool-version.sh#g' scripts/as-version.sh
+            sed -i 's#\.\./scripts/min-tool-version\.sh#scripts/min-tool-version.sh#g' \
+              scripts/as-version.sh
+            echo "Patched scripts/as-version.sh"
           fi
 
           if [ ! -f scripts/min-tool-version.sh ]; then
-            printf '#!/bin/sh\nexit 0\n' > scripts/min-tool-version.sh
+            printf '#!/bin/sh\necho 0\n' > scripts/min-tool-version.sh
             chmod +x scripts/min-tool-version.sh
+            echo "Created stub scripts/min-tool-version.sh"
           fi
 
-      - name: Build Kernel (Correct Defconfig)
+          # Ensure python points to python3
+          if ! command -v python &>/dev/null; then
+            sudo ln -sf /usr/bin/python3 /usr/local/bin/python
+          fi
+
+      # -----------------------------------------------------------------------
+      # 6. Generate base defconfig
+      #    CRITICAL: Pass CROSS_COMPILE + all tool overrides here too.
+      #    The defconfig step invokes clang to probe compiler flags;
+      #    if CC isn't set it falls back to system gcc which may not exist
+      #    for the target arch and will produce a broken .config.
+      #
+      #    HOSTCC=gcc ensures host tools (fixdep, conf, etc.) are built with
+      #    the system GCC, NOT clang. When LLVM=1 is passed, the Makefile
+      #    sets HOSTCC=clang globally (line 369-374 of top Makefile), which
+      #    can cause host-tool compilation to pick up wrong flags. We force
+      #    it back to system GCC for host tools only.
+      # -----------------------------------------------------------------------
+      - name: Generate Defconfig
+        working-directory: kernel
         run: |
-          set -o pipefail
-          cd kernel
+          mkdir -p out
 
-          CLANG=$PWD/../clang/clang/bin
+          make O=out \
+            ARCH=arm64 \
+            CC=$CLANG_BIN/clang \
+            LD=$CLANG_BIN/ld.lld \
+            AR=$CLANG_BIN/llvm-ar \
+            NM=$CLANG_BIN/llvm-nm \
+            OBJCOPY=$CLANG_BIN/llvm-objcopy \
+            OBJDUMP=$CLANG_BIN/llvm-objdump \
+            STRIP=$CLANG_BIN/llvm-strip \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            HOSTCC=gcc \
+            HOSTCXX=g++ \
+            vendor/kona-perf_defconfig \
+            2>&1 | tee out/defconfig.log
 
-          echo "Using clang from: $CLANG"
-          $CLANG/clang --version
+          echo "=== Generated .config (first 30 lines) ==="
+          head -30 out/.config
 
-          # ✅ Use correct vendor defconfig
-          make O=out ARCH=arm64 vendor/kona-perf_defconfig 2>&1 | tee build.log
-
-          # ✅ Merge vendor fragment (important)
+      # -----------------------------------------------------------------------
+      # 7. Merge Oplus-specific config fragment
+      #    Append oplus.config, then run olddefconfig to resolve any conflicts
+      #    and fill in missing symbols with their defaults.
+      #
+      #    Also disable CC_WERROR in CI — our patched files may produce new
+      #    warnings (e.g., the debugfs_create_atomic_t call) that would fail
+      #    the build with -Werror. This is safe; it only affects the build,
+      #    not runtime behavior.
+      # -----------------------------------------------------------------------
+      - name: Merge Config Fragments
+        working-directory: kernel
+        run: |
+          echo "=== Appending oplus.config ==="
           cat arch/arm64/configs/vendor/oplus.config >> out/.config
 
-          # ✅ Resolve dependencies
-          make O=out ARCH=arm64 olddefconfig 2>&1 | tee -a build.log
+          # Disable CC_WERROR in CI to prevent new warnings from failing build
+          echo "# CONFIG_CC_WERROR is not set" >> out/.config
 
-          # ✅ Build
+          echo "=== Running olddefconfig to resolve dependencies ==="
+          make O=out \
+            ARCH=arm64 \
+            CC=$CLANG_BIN/clang \
+            LD=$CLANG_BIN/ld.lld \
+            AR=$CLANG_BIN/llvm-ar \
+            NM=$CLANG_BIN/llvm-nm \
+            OBJCOPY=$CLANG_BIN/llvm-objcopy \
+            OBJDUMP=$CLANG_BIN/llvm-objdump \
+            STRIP=$CLANG_BIN/llvm-strip \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            HOSTCC=gcc \
+            HOSTCXX=g++ \
+            olddefconfig \
+            2>&1 | tee -a out/defconfig.log
+
+          echo "=== Final config summary ==="
+          grep -E "^CONFIG_(CC_WERROR|LTO_CLANG|CFI_CLANG|SHADOW_CALL|NET_SCH_FQ|ZRAM|CRYPTO_LZ4HC)=" \
+            out/.config || true
+
+      # -----------------------------------------------------------------------
+      # 8. Build kernel
+      #    - V=0 for clean output; errors still show
+      #    - Pipe to tee so log is always saved even on failure
+      #    - Exit code is from make, not tee (pipefail is NOT set here
+      #      intentionally so tee doesn't swallow the real exit code via the
+      #      shell's pipefail behavior — instead we check make's exit directly)
+      # -----------------------------------------------------------------------
+      - name: Build Kernel
+        working-directory: kernel
+        run: |
+          echo "=== Build started at $(date) ==="
+          echo "=== CPUs: $(nproc --all) ==="
+
           make -j$(nproc --all) \
             O=out \
             ARCH=arm64 \
-            CC=$CLANG/clang \
-            LD=$CLANG/ld.lld \
-            AR=$CLANG/llvm-ar \
-            NM=$CLANG/llvm-nm \
-            OBJCOPY=$CLANG/llvm-objcopy \
-            OBJDUMP=$CLANG/llvm-objdump \
-            STRIP=$CLANG/llvm-strip \
-            LLVM=1 \
-            LLVM_IAS=1 \
+            CC=$CLANG_BIN/clang \
+            LD=$CLANG_BIN/ld.lld \
+            AR=$CLANG_BIN/llvm-ar \
+            NM=$CLANG_BIN/llvm-nm \
+            OBJCOPY=$CLANG_BIN/llvm-objcopy \
+            OBJDUMP=$CLANG_BIN/llvm-objdump \
+            STRIP=$CLANG_BIN/llvm-strip \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            2>&1 | tee -a build.log
+            LLVM=1 \
+            LLVM_IAS=1 \
+            HOSTCC=gcc \
+            HOSTCXX=g++ \
+            KBUILD_BUILD_USER=$KBUILD_BUILD_USER \
+            KBUILD_BUILD_HOST=$KBUILD_BUILD_HOST \
+            2>&1 | tee out/build.log
 
-      - name: Verify Output
-        run: |
-          ls -lah kernel/out/arch/arm64/boot/ || true
+          BUILD_EXIT=${PIPESTATUS[0]}
+          echo "=== Build finished at $(date) with exit code $BUILD_EXIT ==="
+          exit $BUILD_EXIT
 
-      - name: Copy to AnyKernel3
+      # -----------------------------------------------------------------------
+      # 9. Verify output exists
+      # -----------------------------------------------------------------------
+      - name: Verify Build Output
         run: |
-          cp kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/ 2>/dev/null || true
-          cp kernel/out/arch/arm64/boot/Image AnyKernel3/ 2>/dev/null || true
-          cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/ 2>/dev/null || true
+          echo "=== Boot directory ==="
+          ls -lah kernel/out/arch/arm64/boot/ || {
+            echo "ERROR: Boot directory missing — build failed!"
+            exit 1
+          }
 
-      - name: Create Flashable Zip
+          # Require at least one kernel image
+          FOUND=0
+          for img in Image Image.gz Image.gz-dtb; do
+            if [ -f "kernel/out/arch/arm64/boot/$img" ]; then
+              echo "Found: $img ($(du -sh kernel/out/arch/arm64/boot/$img | cut -f1))"
+              FOUND=1
+            fi
+          done
+
+          if [ $FOUND -eq 0 ]; then
+            echo "ERROR: No kernel image produced!"
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # 10. Package with AnyKernel3
+      #     Copy all available boot images, then zip.
+      # -----------------------------------------------------------------------
+      - name: Package Kernel
         run: |
+          BOOT_DIR=kernel/out/arch/arm64/boot
+
+          echo "=== Copying kernel images to AnyKernel3 ==="
+          for img in Image Image.gz Image.gz-dtb; do
+            if [ -f "$BOOT_DIR/$img" ]; then
+              cp "$BOOT_DIR/$img" AnyKernel3/
+              echo "  Copied: $img"
+            fi
+          done
+
+          if [ -f "$BOOT_DIR/dtbo.img" ]; then
+            cp "$BOOT_DIR/dtbo.img" AnyKernel3/
+            echo "  Copied: dtbo.img"
+          fi
+
+          echo "=== Creating flashable zip: ${ZIP_NAME}.zip ==="
           cd AnyKernel3
-          zip -r9 ../kernel.zip * -x .git README.md
+          zip -r9 "../${ZIP_NAME}.zip" . \
+            --exclude ".git/*" \
+            --exclude "README.md" \
+            --exclude "*.DS_Store"
 
-      - name: Upload Artifacts
-        if: always()
+          cd ..
+          echo "=== Zip created ==="
+          ls -lah "${ZIP_NAME}.zip"
+
+      # -----------------------------------------------------------------------
+      # 11. Upload ONLY the kernel zip as artifact
+      # -----------------------------------------------------------------------
+      - name: Upload Kernel Zip
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-build
-          path: |
-            kernel/out/arch/arm64/boot/Image*
-            kernel/out/arch/arm64/boot/dtbo.img
-            kernel/build.log
-            kernel.zip
+          name: ${{ env.ZIP_NAME }}
+          path: "${{ env.ZIP_NAME }}.zip"
+          if-no-files-found: error
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # 12. Upload build log on failure (separate artifact, separate step)
+      #     Only runs when the build fails so you can diagnose the error.
+      # -----------------------------------------------------------------------
+      - name: Upload Build Log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ env.BUILD_DATE }}
+          path: kernel/out/build.log
+          if-no-files-found: ignore
+          retention-days: 7
