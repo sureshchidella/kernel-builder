@@ -21,7 +21,7 @@ jobs:
 
       - name: Clone Kernel
         run: |
-          git clone --depth=1 https://github.com/AxionAOSP-devices/android_kernel_realme_sm8250.git kernel
+          git clone --depth=1 https://github.com/sureshchidella/android_kernel_realme_sm8250.git kernel
 
       - name: Clone Clang-20
         run: |
